@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8" standalone="no"?>
+<modDesc descVersion="110">
+    <author>xtcg</author>
+    <version>0.1.0.0</version>
+    <title>
+        <en>Production Input Fix</en>
+        <de>Produktions-Eingangs-Fix</de>
+    </title>
+    <description>
+        <en><![CDATA[Production points no longer make more output than their inputs allow.
+
+The base game checks a production step's inputs at real-time speed but runs the step at game speed. At higher time scales the last step before an input runs dry makes its full output from what is left, so fast productions turn 100 L into several hundred litres (e.g. Hof Bergmann cream separator, calf milk mixer, milking carousel).
+
+With this mod each step uses at most what the inputs hold and the outputs can take, so every recipe yields exactly its ratio. Steps that fit are run as before. Works for base-game, map and mod productions; no savegame data.
+
+- Console: pifInfo lists the steps the fix limited and the output it kept from appearing, pifToggle turns the fix off/on for comparison]]></en>
+    </description>
+    <iconFilename>icon_ProductionInputFix.dds</iconFilename>
+    <multiplayer supported="true"/>
+
+    <extraSourceFiles>
+        <sourceFile filename="scripts/ProductionInputFix.lua"/>
+    </extraSourceFiles>
+</modDesc>
