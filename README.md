@@ -22,7 +22,9 @@ On the milking carousel the milk collector feeds about 133 L of raw milk per upd
 
 ## The fix
 
-The mod hooks `ProductionChainManager.update`. Before the base game runs a point, it checks each active production. If a step needs more input than the point holds, or more output space than is free, the mod scales that production's `cyclesPerMinute` down for this step only. The step then uses at most what is there, and the value is restored right after.
+The mod hooks the base `ProductionPoint.updateProduction`. After Hof Bergmann's wrappers transfer/refill inputs, it installs lazy rate hooks for every registered recipe, including initially inactive ones that callbacks may activate during the same update. Overlapping registries are deduplicated. Each recipe's `cyclesPerMinute` is resolved only when the unchanged base loop reads it to calculate consumption. The rate is limited against live stock and free space left by preceding recipes. The active array stays the original Lua table throughout: enumeration, insertion, removal and HB autoOff callbacks retain their normal effects. If a step needs more input than the point holds, or more output space than is free, the mod scales that production's `cyclesPerMinute` down for this step only. The step then uses at most what is there, and all original rate fields and metatables are restored on exit, including errors.
+
+For HB wrappers loaded before the fix that already captured the original base method, the chain-manager hook temporarily intercepts `updateAutoFillInputs` and installs the lazy rate hooks immediately after the pre-update refill. It restores the configured rate before the post-update refill, and restores the instance method, rates and metatables even on errors.
 
 The base loop and any wrappers a map adds (Hof Bergmann's input refill, milk collector, animal output) run unchanged. Steps that fit run exactly as in the base game. Production costs are untouched.
 
@@ -39,7 +41,7 @@ Console commands:
 
 ## Tests
 
-The tests run the real base-game `updateProduction` and `ProductionChainManager:update`, read from the decompiled game source (`FS25_SOURCE`, default `../FS25`), with and without the fix.
+The tests run the real base-game `updateProduction` and `ProductionChainManager:update`, read from the decompiled game source (`FS25_SOURCE`, default `../FS25`), with and without the fix. Wrapper-order regressions also read the real HB milk-collector and input-refill wrappers from `FS25_SOURCE/hb_1.5b1/scripts`, testing wrappers loaded both before and after the fix.
 
     pip install lupa
     python tests/run.py

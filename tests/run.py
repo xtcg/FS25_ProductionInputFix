@@ -28,6 +28,15 @@ def extract(path, start, end):
     return m.group(0)
 
 
+def function_code(path, name):
+    with open(path, encoding="utf-8") as f:
+        source = f.read()
+    match = re.search(r"function " + re.escape(name) + r"\(.*?(?=\nfunction |\Z)", source, re.S)
+    if match is None:
+        sys.exit(f"cannot find {name!r} in {path}")
+    return match.group(0)
+
+
 def base_code():
     pp = os.path.join(SOURCE, "dataS/scripts/objects/ProductionPoint.lua")
     cm = os.path.join(SOURCE, "dataS/scripts/misc/ProductionChainManager.lua")
@@ -39,6 +48,19 @@ def run(path, base):
     lua = lupa.LuaRuntime(unpack_returned_tuples=True)
     lua.globals().REPO = REPO + "/"
     lua.globals().BASE_CODE = base
+    with open(os.path.join(SOURCE, "hb_1.5b1/scripts/PlaceableMilkCollector.lua"), encoding="utf-8") as f:
+        milk = f.read()
+    lua.globals().HB_MILK_HOOK = milk[milk.index("function PlaceableMilkCollector.installProductionPointHooks()"):]
+    with open(os.path.join(SOURCE, "hb_1.5b1/scripts/ExtendedProductionPointInputRefill.lua"), encoding="utf-8") as f:
+        refill = f.read()
+    lua.globals().HB_REFILL_HOOK = refill[refill.index("function ExtendedProductionPointInputRefill.install()"):refill.index("-- Keep the threshold descriptor")]
+    pp = os.path.join(SOURCE, "dataS/scripts/objects/ProductionPoint.lua")
+    hb = os.path.join(SOURCE, "hb_1.5b1/scripts/PlaceableExtendedProductionPoint.lua")
+    lua.globals().HB_STATE_CODE = "\n".join([
+        function_code(pp, "ProductionPoint:setProductionState"),
+        function_code(pp, "ProductionPoint:setProductionStatus"),
+        function_code(hb, "ExtendedProductionPoint:setProductionStatus"),
+    ])
     with open(os.path.join(TESTS, "stubs.lua"), encoding="utf-8") as f:
         lua.execute(f.read())
     with open(path, encoding="utf-8") as f:

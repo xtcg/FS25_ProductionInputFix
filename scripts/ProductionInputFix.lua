@@ -10,8 +10,8 @@
 -- with high cyclesPerHour (cream 4000/h, calf milk 2000/h, milking carousel
 -- 12000/h on Hof Bergmann) turn 100 L into several hundred litres.
 --
--- Fix: right before the chain manager runs a production point, every active
--- production whose step does not fit gets its cyclesPerMinute scaled down so
+-- Fix: after map wrappers refill inputs, each recipe is limited when the base
+-- loop reads its rate, using live stock left by preceding recipes. Its cyclesPerMinute is scaled so
 -- the step uses at most what the inputs hold and the outputs can take. The
 -- value is restored right after. The base loop and every wrapper a map or mod
 -- put around updateProduction run unchanged.
@@ -20,118 +20,107 @@ ProductionInputFix = {}
 ProductionInputFix.MOD_NAME = g_currentModName
 ProductionInputFix.enabled = true
 ProductionInputFix.MARGIN = 0.999999 -- keep the scaled step just below the stock so float rounding never trips the base check
-ProductionInputFix.MIN_FACTOR = 1e-6 -- below this the base check reports missing inputs / no space by itself
 ProductionInputFix.stats = {}
 
---- Scales the step of each active production of one point.
--- @return list of {production, cyclesPerMinute} to restore, or nil if nothing changed
-function ProductionInputFix.limitSteps(productionPoint)
-    if not ProductionInputFix.enabled or productionPoint == nil or not productionPoint.isOwned then
-        return nil
+-- Limit one recipe using the live stock left by the preceding recipe.
+local function limitProduction(point, production, divisor, cycles)
+    local dt = math.clamp(g_time - point.lastUpdatedTime, 0, 30000)
+    local environment = g_currentMission ~= nil and g_currentMission.environment
+    local adjust = environment ~= nil and environment.timeAdjustment or 1
+    local step = cycles * dt * (point.minuteFactorTimescaled or 0) * adjust
+    local realStep = cycles * dt / 60000 * adjust
+    local factor, inputLimited, baseWouldPass = 1, false, true
+    local wasUpdating = point.updatingProduction
+    point.updatingProduction = true
+    for _, input in ipairs(production.inputs) do
+        local level = point:getFillLevel(input.type) or 0
+        local checked = input.amount * realStep
+        local need = math.max(input.amount * step / divisor, checked)
+        if level < checked then baseWouldPass = false end
+        if need > 0 and level < need then
+            factor = math.min(factor, level / need)
+            inputLimited = true
+        end
     end
-
-    local productions = productionPoint.activeProductions
-    if productionPoint.lastUpdatedTime == nil or productions == nil or #productions == 0 then
-        return nil
-    end
-
-    local environment = g_currentMission ~= nil and g_currentMission.environment or nil
-    local timeAdjust = environment ~= nil and environment.timeAdjustment or 1
-    local dt = math.clamp(g_time - productionPoint.lastUpdatedTime, 0, 30000)
-    local minuteFactorDt = dt * (productionPoint.minuteFactorTimescaled or 0) * timeAdjust
-    local realMinutes = dt / 60000 * timeAdjust
-    local divisor = productionPoint.sharedThroughputCapacity and #productions or 1
-
-    local levels = {}
-    local freeSpace = {}
-    local changed = nil
-
-    -- Hof Bergmann's animal-input points round animal fill levels up for the HUD unless this flag is set
-    local wasUpdating = productionPoint.updatingProduction
-    productionPoint.updatingProduction = true
-
-    for _, production in ipairs(productions) do
-        local cyclesPerMinute = production.cyclesPerMinute or 0
-        local stepCycles = cyclesPerMinute * minuteFactorDt
-        local factor = 1
-        local inputLimited = false
-        local baseWouldPass = true
-
-        for _, input in ipairs(production.inputs) do
-            if levels[input.type] == nil then
-                levels[input.type] = productionPoint:getFillLevel(input.type) or 0
-            end
-
-            local level = levels[input.type]
-            local consumed = input.amount * stepCycles / divisor
-            -- the base check asks for this much; when it is stricter than the real use, honour it
-            local checked = input.amount * cyclesPerMinute * realMinutes
-            local need = math.max(consumed, checked)
-
-            if level < checked then
+    for _, output in ipairs(production.outputs) do
+        if not output.sellDirectly then
+            local need = output.amount * step
+            local space = point.storage:getFreeCapacity(output.type) or 0
+            if need > 0 and space < need then
+                factor = math.min(factor, space / need)
                 baseWouldPass = false
             end
-
-            if need > 0 and level < need then
-                factor = math.min(factor, level / need)
-                inputLimited = true
-            end
-        end
-
-        for _, output in ipairs(production.outputs) do
-            if not output.sellDirectly then
-                if freeSpace[output.type] == nil then
-                    freeSpace[output.type] = productionPoint.storage:getFreeCapacity(output.type) or 0
-                end
-
-                -- the base checks the undivided amount against free space
-                local need = output.amount * stepCycles
-                if need > 0 and freeSpace[output.type] < need then
-                    factor = math.min(factor, freeSpace[output.type] / need)
-                    baseWouldPass = false
-                end
-            end
-        end
-
-        if factor < 1 then
-            if factor >= ProductionInputFix.MIN_FACTOR then
-                factor = factor * ProductionInputFix.MARGIN
-                changed = changed or {}
-                table.insert(changed, {production, cyclesPerMinute})
-                production.cyclesPerMinute = cyclesPerMinute * factor
-
-                if inputLimited and baseWouldPass then
-                    ProductionInputFix.recordWithheld(productionPoint, production, stepCycles / divisor * (1 - factor))
-                end
-            else
-                factor = 0 -- leave the step as is; the base check stops it
-            end
-        end
-
-        if factor > 0 then
-            local cycles = stepCycles * factor / divisor
-            for _, input in ipairs(production.inputs) do
-                levels[input.type] = levels[input.type] - input.amount * cycles
-            end
-            for _, output in ipairs(production.outputs) do
-                if not output.sellDirectly then
-                    freeSpace[output.type] = freeSpace[output.type] - output.amount * cycles
-                end
-            end
         end
     end
-
-    productionPoint.updatingProduction = wasUpdating
-
-    return changed
+    point.updatingProduction = wasUpdating
+    -- At zero stock/space the original base check blocks this recipe. Any
+    -- positive stock, however small, must be limited rather than left at full speed.
+    if not inputLimited and factor < 1e-6 then return cycles end
+    if factor > 0 and factor < 1 then
+        factor = factor * ProductionInputFix.MARGIN
+        if inputLimited and baseWouldPass then
+            ProductionInputFix.recordWithheld(point, production, step / divisor * (1 - factor))
+        end
+        return cycles * factor
+    end
+    return cycles
 end
 
-function ProductionInputFix.restore(changed)
-    if changed ~= nil then
-        for _, entry in ipairs(changed) do
-            entry[1].cyclesPerMinute = entry[2]
+--- The base loop reads cyclesPerMinute just before calculating each recipe's
+-- step. Resolve that rate lazily against live stock, keeping activeProductions
+-- itself untouched so HB's enumeration, autoOff removal and activation persist.
+function ProductionInputFix.limitSteps(point)
+    if not ProductionInputFix.enabled or point == nil or not point.isOwned
+        or point.lastUpdatedTime == nil then return nil end
+    if point.pifStepView ~= nil then return nil end
+    local productions = point.activeProductions
+    if productions == nil or #productions == 0 then return nil end
+    local state = { point = point, entries = {} }
+    local divisor = point.sharedThroughputCapacity and #productions or 1
+    local seen = {}
+    local function wrapProduction(production)
+        if seen[production] then return end
+        seen[production] = true
+        local originalMetatable = getmetatable(production)
+        local entry = { production = production, metatable = originalMetatable,
+            rawRate = rawget(production, "cyclesPerMinute"), rate = production.cyclesPerMinute or 0 }
+        local view = {}
+        for key, value in pairs(originalMetatable or {}) do view[key] = value end
+        local originalIndex = view.__index
+        view.__index = function(self, key)
+            if key == "cyclesPerMinute" then
+                if not entry.resolved then
+                    -- Mark first so a diagnostic callback reading the rate cannot recurse.
+                    entry.resolved = true
+                    entry.rate = limitProduction(point, self, divisor, entry.rate)
+                end
+                return entry.rate
+            end
+            if type(originalIndex) == "function" then return originalIndex(self, key) end
+            if originalIndex ~= nil then return originalIndex[key] end
         end
+        state.entries[#state.entries + 1] = entry
+        setmetatable(production, view)
+        rawset(production, "cyclesPerMinute", nil)
     end
+    -- setProductionState can activate an initially inactive recipe after autoOff
+    -- shifts the array, and the base loop may reach it in this same update.
+    -- Cover every registered recipe, resolving its rate only if it is read.
+    -- Deduplicate the registries so each field/metatable has one restore entry.
+    for _, production in ipairs(productions) do wrapProduction(production) end
+    for _, production in pairs(point.productions or {}) do wrapProduction(production) end
+    for _, production in pairs(point.productionsIdToObj or {}) do wrapProduction(production) end
+    point.pifStepView = state
+    return state
+end
+
+function ProductionInputFix.restore(state)
+    if state == nil then return end
+    for _, entry in ipairs(state.entries) do
+        rawset(entry.production, "cyclesPerMinute", entry.rawRate)
+        setmetatable(entry.production, entry.metatable)
+    end
+    state.point.pifStepView = nil
 end
 
 --- Counts output the unfixed game would have created from nothing.
@@ -151,31 +140,54 @@ function ProductionInputFix.recordWithheld(productionPoint, production, cycles)
     end
 end
 
+-- Hook the base loop, not the chain manager: map/subclass/instance wrappers
+-- must finish their pre-update input transfers before we inspect the stock.
+function ProductionInputFix.updateProduction(productionPoint, superFunc, ...)
+    local changed = ProductionInputFix.limitSteps(productionPoint)
+    if changed == nil then
+        return superFunc(productionPoint, ...)
+    end
+
+    local result = table.pack(pcall(superFunc, productionPoint, ...))
+    ProductionInputFix.restore(changed)
+
+    if not result[1] then
+        error(result[2], 0)
+    end
+    return table.unpack(result, 2, result.n)
+end
+
+-- HB can capture the original base function while its specialization scripts
+-- load, before this mod loads. Its refill wrapper calls updateAutoFillInputs
+-- immediately before that captured base loop. Intercept that boundary for the
+-- duration of this manager update, then remove the temporary instance method.
 function ProductionInputFix.chainManagerUpdate(manager, superFunc, ...)
     local points = manager.productionPoints
     local count = points ~= nil and #points or 0
-
-    if count == 0 then
-        return superFunc(manager, ...)
-    end
-
-    -- the same point the base update is about to run
     local index = manager.currentUpdateIndex or 1
-    if index > count then
-        index = 1
-    end
-
-    local changed = ProductionInputFix.limitSteps(points[index])
-    if changed == nil then
+    if index > count then index = 1 end
+    local point = points ~= nil and points[index] or nil
+    if point == nil or point.updateAutoFillInputs == nil then
         return superFunc(manager, ...)
     end
 
-    local ok, err = pcall(superFunc, manager, ...)
-    ProductionInputFix.restore(changed)
-
-    if not ok then
-        error(err, 0)
+    local refill = point.updateAutoFillInputs
+    local ownRefill = rawget(point, "updateAutoFillInputs")
+    local changed
+    point.updateAutoFillInputs = function(self, ...)
+        -- HB also refills after production; it must see the configured rate.
+        ProductionInputFix.restore(changed)
+        changed = nil
+        local result = table.pack(refill(self, ...))
+        changed = ProductionInputFix.limitSteps(self)
+        return table.unpack(result, 1, result.n)
     end
+
+    local result = table.pack(pcall(superFunc, manager, ...))
+    ProductionInputFix.restore(changed)
+    point.updateAutoFillInputs = ownRefill
+    if not result[1] then error(result[2], 0) end
+    return table.unpack(result, 2, result.n)
 end
 
 function ProductionInputFix.consoleInfo()
@@ -211,12 +223,15 @@ function ProductionInputFix.consoleToggle()
 end
 
 function ProductionInputFix.install()
-    if ProductionChainManager == nil or ProductionChainManager.update == nil then
-        Logging.warning("ProductionInputFix: ProductionChainManager.update not found, fix not installed")
+    if ProductionPoint == nil or ProductionPoint.updateProduction == nil then
+        Logging.warning("ProductionInputFix: ProductionPoint.updateProduction not found, fix not installed")
         return
     end
 
-    ProductionChainManager.update = Utils.overwrittenFunction(ProductionChainManager.update, ProductionInputFix.chainManagerUpdate)
+    ProductionPoint.updateProduction = Utils.overwrittenFunction(ProductionPoint.updateProduction, ProductionInputFix.updateProduction)
+    if ProductionChainManager ~= nil and ProductionChainManager.update ~= nil then
+        ProductionChainManager.update = Utils.overwrittenFunction(ProductionChainManager.update, ProductionInputFix.chainManagerUpdate)
+    end
 
     if addConsoleCommand ~= nil then
         addConsoleCommand("pifInfo", "Lists production steps the fix limited and the output it kept from appearing", "consoleInfo", ProductionInputFix)

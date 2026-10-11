@@ -26,7 +26,7 @@ local function withFix(enabled, fn)
     if not ok then error(err, 0) end
 end
 
-test("installs on ProductionChainManager.update and logs", function()
+test("installs on ProductionPoint.updateProduction and logs", function()
     check(logContains("ProductionInputFix: installed"), "install log")
     check(COMMANDS.pifInfo ~= nil and COMMANDS.pifToggle ~= nil, "console commands")
 end)
@@ -165,4 +165,147 @@ test("pifInfo reports the output kept from appearing; pifToggle flips", function
     check(info:find("LOWFATMILK 303", 1, true) and info:find("CREAM 130", 1, true), info)
     check(COMMANDS.pifToggle():find("DISABLED"), "toggle off")
     check(COMMANDS.pifToggle():find("enabled"), "toggle on")
+end)
+
+-- Use HB's real collector wrapper: it captures the base method at specialization
+-- load, and transfers milk inside updateProduction, after the chain-manager call.
+local function hbCarousel(refill, initial, capturedBeforeFix)
+    ExtendedProductionPoint = setmetatable({}, { __index = ProductionPoint })
+    ExtendedProductionPoint.superClass = function() return ProductionPoint end
+    if capturedBeforeFix then
+        ExtendedProductionPoint.updateProduction = BASE_UPDATE_PRODUCTION
+    end
+    ExtendedProductionPoint.load = function() return true end
+    ExtendedProductionPoint.loadFromXMLFile = function() end
+    ExtendedProductionPoint.updateAutoFillInputs = function(self)
+        near(self.activeProductions[1].cyclesPerMinute, 200, 0, "throughput during refill")
+    end
+    ExtendedProductionPointInputRefill = { updateFullOutputSpawns = function() end }
+    load(HB_REFILL_HOOK)()
+    ExtendedProductionPointInputRefill.install()
+    PlaceableMilkCollector = {}
+    load(HB_MILK_HOOK)()
+    PlaceableMilkCollector.installProductionPointHooks()
+    local pp = newPoint({
+        name = "HB carousel", timeScale = 120,
+        caps = { RAWMILK = 5000, MILK = 200000 }, levels = { RAWMILK = initial or 0 },
+        productions = { { id = "milk", cph = 12000, inputs = { { "RAWMILK", 1 } }, outputs = { { "MILK", 1 } } } },
+    })
+    setmetatable(pp, { __index = ExtendedProductionPoint })
+    pp.owningPlaceable.transferMilkToProductionPoint = function()
+        -- The collector must see the configured throughput, not a limited one.
+        near(pp.activeProductions[1].cyclesPerMinute, 200, 0, "throughput before transfer")
+        pp.storage:setFillLevel(pp.storage:getFillLevel("RAWMILK") + refill, "RAWMILK")
+    end
+    -- HB also wraps each animal-input instance for unrounded production reads.
+    local old = pp.updateProduction
+    pp.updateProduction = function(self, ...)
+        self.updatingProduction = true
+        local result = old(self, ...)
+        self.updatingProduction = false
+        return result
+    end
+    return pp
+end
+
+test("HB wrapper order: empty raw milk refilled inside update yields 133 L, not 1600 L", function()
+    local pp = hbCarousel(2000 * 4 / 60)
+    runFrames(newManager({ pp }), 10, 4000)
+    near(pp.storage:getFillLevel("MILK"), 20000 / 15, 0.01, "milk from transferred stock")
+    near(pp.storage:getFillLevel("RAWMILK"), 0, 0.001, "raw milk remaining")
+    near(pp.activeProductions[1].cyclesPerMinute, 200, 0, "throughput restored")
+    check(pp.updatingProduction == false, "instance wrapper completes")
+end)
+
+test("HB wrapper reproduces 1600 L from 133 L with the fix disabled", function()
+    withFix(false, function()
+        local pp = hbCarousel(2000 * 4 / 60)
+        runFrames(newManager({ pp }), 1, 4000)
+        near(pp.storage:getFillLevel("MILK"), 1600, 1e-6, "base milk")
+    end)
+end)
+
+test("HB refill is counted before limiting a previously small input", function()
+    local pp = hbCarousel(2000, 10)
+    runFrames(newManager({ pp }), 1, 4000)
+    near(pp.storage:getFillLevel("MILK"), 1600, 1e-6, "full step after refill")
+    near(pp.storage:getFillLevel("RAWMILK"), 410, 1e-6, "remaining input")
+end)
+
+
+test("HB wrappers loaded before fix: refill boundary still limits the captured base loop", function()
+    local pp = hbCarousel(2000 * 4 / 60, 0, true)
+    local inheritedRefill = pp.updateAutoFillInputs
+    runFrames(newManager({ pp }), 10, 4000)
+    near(pp.storage:getFillLevel("MILK"), 20000 / 15, 0.01, "captured-base milk")
+    near(pp.activeProductions[1].cyclesPerMinute, 200, 0, "throughput restored")
+    check(rawget(pp, "updateAutoFillInputs") == nil and pp.updateAutoFillInputs == inheritedRefill, "temporary method removed")
+end)
+
+test("HB captured-base error restores throughput and instance refill method", function()
+    local pp = hbCarousel(2000 * 4 / 60, 0, true)
+    pp.owningPlaceable.productionStatusChanged = function() error("HB boom") end
+    local refill = pp.updateAutoFillInputs
+    pp.lastUpdatedTime = g_time
+    g_time = g_time + 4000
+    local manager = newManager({ pp })
+    local ok, err = pcall(manager.update, manager)
+    check(not ok and tostring(err):find("HB boom", 1, true), "base error propagated")
+    near(pp.activeProductions[1].cyclesPerMinute, 200, 0, "throughput restored after error")
+    check(rawget(pp, "updateAutoFillInputs") == nil and pp.updateAutoFillInputs == refill, "refill method restored after error")
+end)
+
+
+local function chainPoint(shared, reverse)
+    local recipes = {
+        { id = "a_to_b", cph = 60, inputs = {{"A", 1}}, outputs = {{"B", 1}} },
+        { id = "b_to_c", cph = 600, inputs = {{"B", 1}}, outputs = {{"C", 1}} },
+    }
+    if reverse then recipes[1], recipes[2] = recipes[2], recipes[1] end
+    return newPoint({ timeScale = 120, shared = shared, caps = { A=5000, B=5000, C=5000 },
+        levels = { A=100 }, productions = recipes })
+end
+
+test("sequential A -> B -> C uses 8 A to produce at most 8 C", function()
+    local pp = chainPoint(false)
+    local recipes = pp.activeProductions
+    runFrames(newManager({pp}), 1, 4000)
+    near(pp.storage:getFillLevel("A"), 92, 1e-9, "A")
+    near(pp.storage:getFillLevel("B") + pp.storage:getFillLevel("C"), 8, 1e-6, "conserved B+C")
+    near(pp.storage:getFillLevel("C"), 8, 0.001, "C")
+    check(pp.activeProductions == recipes and pp.pifStepView == nil, "recipe view removed")
+end)
+
+test("shared sequential chain conserves inputs across multiple updates", function()
+    local pp = chainPoint(true)
+    runFrames(newManager({pp}), 4, 4000)
+    near(pp.storage:getFillLevel("A") + pp.storage:getFillLevel("B") + pp.storage:getFillLevel("C"), 100, 1e-6, "A+B+C")
+end)
+
+test("reverse recipe order does not consume future output", function()
+    local pp = chainPoint(false, true)
+    runFrames(newManager({pp}), 1, 4000)
+    near(pp.storage:getFillLevel("C"), 0, 0, "no B yet")
+    near(pp.storage:getFillLevel("B"), 8, 1e-6, "B after later recipe")
+    runFrames(newManager({pp}), 1, 4000)
+    near(pp.storage:getFillLevel("A") + pp.storage:getFillLevel("B") + pp.storage:getFillLevel("C"), 100, 1e-6, "conserved stock")
+end)
+
+
+test("lazy rate preserves an inherited rate and the recipe's original metatable", function()
+    local pp = cream({ MILK = 100 })
+    local recipe = pp.activeProductions[1]
+    local inherited = { cyclesPerMinute = recipe.cyclesPerMinute, marker = "original" }
+    recipe.cyclesPerMinute = nil
+    local mt = { __index = inherited }
+    setmetatable(recipe, mt)
+    local active = pp.activeProductions
+    pp.owningPlaceable.productionStatusChanged = function()
+        check(pp.activeProductions == active and recipe.marker == "original", "callback sees original array and inherited fields")
+    end
+    runFrames(newManager({pp}), 1, 4000)
+    near(pp.storage:getFillLevel("LOWFATMILK"), 70, 0.001, "limited output")
+    check(getmetatable(recipe) == mt and rawget(recipe, "cyclesPerMinute") == nil,
+        "metatable and absent raw rate restored")
+    near(recipe.cyclesPerMinute, 4000/60, 0, "inherited rate restored")
 end)

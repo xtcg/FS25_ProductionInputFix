@@ -29,6 +29,7 @@ ProductionChainManager = {}
 ProductionChainManager.__index = ProductionChainManager
 
 load(BASE_CODE)()
+BASE_UPDATE_PRODUCTION = ProductionPoint.updateProduction
 
 -- storage that clamps like Storage:setFillLevel
 local Storage = {}
